@@ -1,0 +1,252 @@
+// ElementorForge — central SaaS database
+// Sandbox/dev: SQLite. Production (docker/): swap provider to postgresql
+// via prisma/schema.postgres.prisma — field names are kept portable.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String   @id @default(cuid())
+  email            String   @unique
+  passwordHash     String
+  name             String?
+  role             String   @default("user") // user | admin
+  onboardedAt      DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  sessions         Session[]
+  subscriptions    Subscription[]
+  sites            Site[]
+  projects         Project[]
+  creditEntries    CreditEntry[]
+  usageLogs        UsageLog[]
+  auditLogs        AuditLog[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId])
+}
+
+model Plan {
+  id             String @id @default(cuid())
+  code           String @unique // free | starter | pro | agency
+  name           String
+  priceCents     Int    @default(0)
+  monthlyCredits Int    @default(0) // AI credits per billing period
+  maxSites       Int    @default(1)
+  features       String @default("[]") // JSON array
+  sortOrder      Int    @default(0)
+  subscriptions  Subscription[]
+}
+
+model Subscription {
+  id               String    @id @default(cuid())
+  userId           String
+  planId           String
+  status           String    @default("active") // active | past_due | canceled | trialing
+  provider         String    @default("test")   // test | stripe
+  providerRef      String?   // stripe customer/subscription id (never exposed)
+  currentPeriodEnd DateTime?
+  cancelAtPeriod   Boolean   @default(false)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan             Plan      @relation(fields: [planId], references: [id])
+  @@index([userId])
+  @@index([planId])
+}
+
+model Site {
+  id                String    @id @default(cuid())
+  userId            String
+  name              String
+  url               String    // canonical site URL
+  mode              String    @default("connector") // connector | elementor_mcp | mcp_third_party
+  status            String    @default("pending")   // pending | pairing | connected | error | disconnected
+  pairingCode       String?                         // short-lived one-time code shown in plugin
+  pairingExpiresAt  DateTime?
+  wpVersion         String?
+  phpVersion        String?
+  elementorVersion  String?
+  elementorPro      Boolean   @default(false)
+  proLicenseOk      Boolean   @default(false)
+  containersEnabled Boolean   @default(true)
+  pluginVersion     String?
+  lastCheckedAt     DateTime?
+  mcpConfig         String    @default("{}") // JSON: endpoint, authType, tool mapping for MCP modes
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credentials       SiteCredential?
+  projects          Project[]
+  auditLogs         AuditLog[]
+  @@index([userId])
+}
+
+// Secrets live server-side only. tokenHash = sha256(siteKey) for lookup;
+// hmacSecret and transportToken are AES-256-GCM encrypted at rest.
+model SiteCredential {
+  id             String   @id @default(cuid())
+  siteId         String   @unique
+  siteKey        String   @unique // public identifier sent with every request
+  hmacSecret     String   // encrypted
+  transportToken String?  // encrypted — for MCP path: WP application password
+  tokenHash      String?  // sha256 of transport token (lookup for revocation)
+  createdAt      DateTime @default(now())
+  rotatedAt      DateTime?
+  site           Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
+}
+
+model Project {
+  id          String    @id @default(cuid())
+  userId      String
+  siteId      String
+  name        String
+  businessName String?
+  industry    String?
+  brief       String    @default("{}") // JSON: raw + analyzed brief
+  referenceUrl String?
+  designInstructions String?
+  pages       String    @default("[]") // JSON: requested page list
+  designSystem String   @default("{}") // JSON: typography/colors/spacing tokens
+  sitemap     String    @default("{}") // JSON: generated sitemap + page specs
+  status      String    @default("draft") // draft | building | review | revising | done | failed
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  site        Site      @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  jobs        BuildJob[]
+  generatedPages GeneratedPage[]
+  @@index([userId])
+  @@index([siteId])
+}
+
+model BuildJob {
+  id          String    @id @default(cuid())
+  projectId   String
+  siteId      String
+  type        String    @default("build_site") // build_site | revise_page | rebuild_page | publish_page
+  status      String    @default("queued") // queued | running | completed | failed | canceled
+  step        String?   // current pipeline step
+  progress    Int       @default(0)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(3)
+  error       String?
+  payload     String    @default("{}") // JSON: instruction / page target etc
+  reservedCredits Int    @default(0)
+  idempotencyKey String @unique
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  logs        JobLog[]
+  @@index([projectId])
+  @@index([status])
+}
+
+model GeneratedPage {
+  id            String    @id @default(cuid())
+  projectId     String
+  siteId        String
+  title         String
+  slug          String
+  status        String    @default("pending") // pending | generated | draft | published | failed
+  wpPageId      Int?      // real WordPress post id (null until connector confirms)
+  elementorJson String    @default("[]") // native Elementor data (validated)
+  specJson      String    @default("{}") // semantic page spec (source for revisions)
+  validationReport String @default("{}") // JSON report
+  verifyHash    String?   // sha256 of confirmed structure read back from WP
+  revision      Int       @default(0)
+  approved      Boolean   @default(false)
+  error         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  revisions     PageRevision[]
+  @@unique([projectId, slug])
+  @@index([projectId])
+  @@index([siteId])
+}
+
+model PageRevision {
+  id             String   @id @default(cuid())
+  pageId         String
+  revision       Int
+  instruction    String?
+  elementorJson  String
+  wpSnapshotHash String?
+  createdAt      DateTime @default(now())
+  page           GeneratedPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  @@index([pageId])
+}
+
+model CreditEntry {
+  id             String   @id @default(cuid())
+  userId         String
+  delta          Int      // positive = grant, negative = consumption
+  balanceAfter   Int
+  reason         String   // signup_bonus | plan_grant | build_reserve | build_consume | build_release | admin_grant
+  idempotencyKey String?  @unique
+  jobId          String?
+  meta           String   @default("{}")
+  createdAt      DateTime @default(now())
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId])
+  @@index([jobId])
+}
+
+model UsageLog {
+  id        String   @id @default(cuid())
+  userId    String
+  provider  String   // anthropic | openai | zai | mock
+  model     String
+  step      String   // analyze | sitemap | design_system | components | revise
+  tokensIn  Int      @default(0)
+  tokensOut Int      @default(0)
+  jobId     String?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId])
+}
+
+model JobLog {
+  id        String   @id @default(cuid())
+  jobId     String
+  level     String   @default("info") // debug | info | warn | error
+  step      String?
+  message   String
+  meta      String   @default("{}")
+  createdAt DateTime @default(now())
+  job       BuildJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  @@index([jobId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  siteId    String?
+  action    String   // e.g. auth.login, site.pair, page.publish, credits.grant
+  ip        String?
+  meta      String   @default("{}")
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  site      Site?    @relation(fields: [siteId], references: [id], onDelete: SetNull)
+  @@index([userId])
+  @@index([siteId])
+}

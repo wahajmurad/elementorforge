@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+# Background worker: consumes the BullMQ queue (QUEUE_DRIVER=bullmq).
+FROM node:22-slim AS base
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+FROM base AS build
+COPY package.json bun.lock* package-lock.json* ./
+RUN corepack enable && (bun install --frozen-lockfile 2>/dev/null || npm ci)
+COPY . .
+RUN npx prisma generate --schema prisma/schema.postgres.prisma
+
+FROM base AS runner
+ENV NODE_ENV=production QUEUE_DRIVER=bullmq
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/src ./src
+COPY --from=build /app/prisma ./prisma
+COPY --from=build /app/tsconfig.json ./
+COPY --from=build /app/package.json ./
+EXPOSE 9178
+CMD ["npx", "tsx", "docker/worker-main.ts"]
